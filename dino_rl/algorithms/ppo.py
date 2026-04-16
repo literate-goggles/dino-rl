@@ -260,7 +260,7 @@ MINIBATCH_SIZE = 512
 ENTROPY_COEFF = 0.01
 VALUE_COEFF = 0.5
 TARGET_EVAL_SCORE = 10000
-SCORE_DELTA_COEFF = 0.02
+SCORE_DELTA_COEFF = 0.03
 
 
 # ---------------------------------------------------------------------------
