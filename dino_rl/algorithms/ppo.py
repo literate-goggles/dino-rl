@@ -279,6 +279,10 @@ BROWSER_IMAGE_PPO_EPOCHS = 4
 BROWSER_IMAGE_MINIBATCH_SIZE = 64
 BROWSER_IMAGE_EVAL_EPISODES = 3
 BROWSER_IMAGE_EVAL_MAX_STEPS = 6250
+# Browser-image PPO was getting stuck near-uniform (entropy ~0.95 of ln(3))
+# while value loss exploded: the 0.01 entropy bonus was dominating a weak
+# advantage signal. 0.003 still keeps meaningful exploration pressure.
+BROWSER_IMAGE_ENTROPY_COEFF = 0.003
 
 
 def save_checkpoint(
@@ -1133,6 +1137,8 @@ def train(
             algo_name = f"{algo_name}_{observation_mode}"
     if observation_mode == "image" and score_delta_coeff == SCORE_DELTA_COEFF:
         score_delta_coeff = 0.0
+    if observation_mode == "image" and entropy_coeff == ENTROPY_COEFF:
+        entropy_coeff = BROWSER_IMAGE_ENTROPY_COEFF
 
     best_ckpt_path, last_ckpt_path = get_ppo_checkpoint_paths(
         env_backend,
