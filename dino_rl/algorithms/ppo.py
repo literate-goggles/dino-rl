@@ -273,12 +273,7 @@ BROWSER_EVAL_EPISODES = 5
 BROWSER_EVAL_MAX_STEPS = 50000
 BROWSER_IMAGE_SIZE = 84
 BROWSER_IMAGE_STACK = 4
-# Halved from 4 to 2: at ~30 FPS Chrome Dino runs, action_repeat=4 commits
-# the agent to an action for ~130 ms per decision, which is the same order
-# as obstacle approach windows at higher game speeds. Repeat=2 also cuts
-# the Selenium round-trips per env.step in half, roughly doubling training
-# throughput.
-BROWSER_IMAGE_ACTION_REPEAT = 2
+BROWSER_IMAGE_ACTION_REPEAT = 4
 BROWSER_IMAGE_ROLLOUT_LEN = 512
 BROWSER_IMAGE_PPO_EPOCHS = 4
 BROWSER_IMAGE_MINIBATCH_SIZE = 64
