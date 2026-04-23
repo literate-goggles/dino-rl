@@ -273,9 +273,7 @@ BROWSER_EVAL_EPISODES = 5
 BROWSER_EVAL_MAX_STEPS = 50000
 BROWSER_IMAGE_SIZE = 84
 BROWSER_IMAGE_STACK = 4
-# Halved from 4: gives the policy twice the reactivity at high game speeds
-# and cuts Selenium round-trips per env.step in half (+~35% throughput).
-BROWSER_IMAGE_ACTION_REPEAT = 2
+BROWSER_IMAGE_ACTION_REPEAT = 4
 BROWSER_IMAGE_ROLLOUT_LEN = 512
 BROWSER_IMAGE_PPO_EPOCHS = 4
 BROWSER_IMAGE_MINIBATCH_SIZE = 64
