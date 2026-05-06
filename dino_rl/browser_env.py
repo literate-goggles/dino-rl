@@ -601,17 +601,10 @@ class ChromeDinoImageEnv:
                 distance_delta = max(current_distance - prev_distance, 0.0)
                 self._last_distance_ran = current_distance
                 score = int(state["score"])
+                recent_frames.append(self._capture_frame())
                 total_reward += self.distance_reward_scale * distance_delta
 
                 done = bool(state["crashed"])
-                # Capture only on the last action_repeat frame (or on crash).
-                # Dino has no flicker, so the prior max-pool over every frame
-                # was wasted Selenium work. canvas->base64 PNG is one of the
-                # heavier per-step calls.
-                is_last_repeat = repeat_idx == self.action_repeat - 1
-                if is_last_repeat or done:
-                    recent_frames.append(self._capture_frame())
-
                 if done:
                     total_reward += self.gameover_penalty
                     break
