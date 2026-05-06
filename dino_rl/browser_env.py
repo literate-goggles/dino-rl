@@ -451,7 +451,12 @@ class ChromeDinoImageEnv:
         self.obs_size = obs_size
         self.frame_stack = frame_stack
         self.action_repeat = action_repeat
-        self.distance_reward_scale = 0.02
+        # 0.02 produced episode returns of +25 to +30 which the 128-dim
+        # value head could not MSE-fit (value loss pinned >100, advantages
+        # too noisy for the policy to exploit). 0.002 brings returns into
+        # [-1, +3], a scale the critic actually tracks. Validated as a
+        # standalone mechanism in Exp 2 (commit 333ba28).
+        self.distance_reward_scale = 0.002
         self.gameover_penalty = -1.0
         self.crop_top_ratio = crop_top_ratio
         self.crop_bottom_ratio = crop_bottom_ratio
