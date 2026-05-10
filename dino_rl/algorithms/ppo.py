@@ -273,11 +273,18 @@ BROWSER_EVAL_EPISODES = 5
 BROWSER_EVAL_MAX_STEPS = 50000
 BROWSER_IMAGE_SIZE = 84
 BROWSER_IMAGE_STACK = 4
-BROWSER_IMAGE_ACTION_REPEAT = 4
+# Halved from 4: at ~30 FPS, action_repeat=4 commits the policy to an
+# action for ~130 ms which is close to the obstacle-reaction window at
+# higher game speeds. Repeat=2 also halves Selenium round-trips per env
+# step (+~35% throughput).
+BROWSER_IMAGE_ACTION_REPEAT = 2
 BROWSER_IMAGE_ROLLOUT_LEN = 512
 BROWSER_IMAGE_PPO_EPOCHS = 4
 BROWSER_IMAGE_MINIBATCH_SIZE = 64
-BROWSER_IMAGE_EVAL_EPISODES = 3
+# 3 episodes produced eval avgs with std ~30 (e.g. baseline scores
+# [96, 49, 101] -> avg 82 that is not reproducible). 7 reduces SEM ~1.5x
+# so small (10+ point) improvements can actually be distinguished from noise.
+BROWSER_IMAGE_EVAL_EPISODES = 7
 BROWSER_IMAGE_EVAL_MAX_STEPS = 6250
 
 
