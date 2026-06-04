@@ -16,6 +16,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pciutils \
     && rm -rf /var/lib/apt/lists/*
 
+# System libraries required by the Selenium-managed headless Chrome used by the
+# browser-image PPO env (dino_rl/browser_env.py). Without these the cached
+# Chrome binary aborts on launch with "error while loading shared libraries".
+# This is Chrome's declared dependency set (see its deb.deps manifest).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 \
+    libatspi2.0-0 libcairo2 libcups2 libcurl4 libdbus-1-3 libexpat1 libgbm1 \
+    libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libudev1 libvulkan1 \
+    libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 \
+    libxrandr2 xdg-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN mkdir /build
 RUN pip install wheel setuptools pip pybind11
 RUN pip3 --no-cache-dir install --upgrade awscli
