@@ -1208,6 +1208,7 @@ def train(
     # ------------------------------------------------------------------
     for update in range(1, n_updates + 1):
         # ---- 1. Collect rollout --------------------------------------
+        rollout_start = time.time()
         model.eval()
         state, episode_scores = collect_rollout(
             env,
@@ -1218,11 +1219,13 @@ def train(
             score_delta_coeff,
         )
         model.train()
+        rollout_time = time.time() - rollout_start
 
         total_steps += rollout_len
         all_episode_scores.extend(episode_scores)
 
         # ---- 2. PPO parameter update ---------------------------------
+        update_start = time.time()
         metrics = ppo_update(
             model=model,
             optimizer=optimizer,
@@ -1233,6 +1236,23 @@ def train(
             entropy_coeff=entropy_coeff,
             value_coeff=value_coeff,
         )
+        optimize_time = time.time() - update_start
+
+        # ---- Throughput (primary metric) -----------------------------
+        # steps/sec for this update (env + optimize), plus the sustained
+        # rate since training started. The rollout (browser/env) cost
+        # dominates, so we surface it split out from the GPU optimize step.
+        sec_per_update = rollout_time + optimize_time
+        update_steps_per_sec = rollout_len / sec_per_update if sec_per_update else 0.0
+        elapsed_so_far = time.time() - train_start
+        sustained_steps_per_sec = (
+            total_steps / elapsed_so_far if elapsed_so_far else 0.0
+        )
+        writer.add_scalar("perf/steps_per_sec", update_steps_per_sec, update)
+        writer.add_scalar("perf/steps_per_sec_sustained", sustained_steps_per_sec, update)
+        writer.add_scalar("perf/sec_per_update", sec_per_update, update)
+        writer.add_scalar("perf/rollout_time", rollout_time, update)
+        writer.add_scalar("perf/optimize_time", optimize_time, update)
 
         # ---- 3. Anneal learning rate ---------------------------------
         scheduler.step()
@@ -1258,6 +1278,13 @@ def train(
                 f"Entropy {metrics['entropy']:.4f} | "
                 f"KL {metrics['approx_kl']:.5f} | "
                 f"Clip {metrics['clip_frac']:.3f}"
+            )
+            print(
+                f"  >> Throughput @ update {update}: "
+                f"{update_steps_per_sec:6.2f} steps/sec "
+                f"({sustained_steps_per_sec:6.2f} sustained) | "
+                f"sec/update {sec_per_update:6.2f} "
+                f"(rollout {rollout_time:6.2f} + optimize {optimize_time:5.2f})"
             )
             writer.add_scalar("train/policy_loss", metrics["policy_loss"], update)
             writer.add_scalar("train/value_loss", metrics["value_loss"], update)
