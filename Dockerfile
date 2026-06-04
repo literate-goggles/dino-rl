@@ -1,0 +1,28 @@
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG TZ=UTC
+
+# mostly development or debugging tools
+RUN apt update && apt install -y sudo curl wget git ffmpeg tmux s3fs htop nvtop
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # essential RDMA libraries
+    rdma-core \
+    libibverbs-dev \
+    # diagnostic tools
+    infiniband-diags \
+    iproute2 \
+    pciutils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir /build
+RUN pip install wheel setuptools pip pybind11
+RUN pip3 --no-cache-dir install --upgrade awscli
+
+ADD requirements.txt /build/requirements.txt
+
+RUN grep -v "flash-attn" /build/requirements.txt > /build/requirements_no_flash.txt
+RUN pip install -r /build/requirements_no_flash.txt
+RUN pip install flash-attn==2.7.0.post2 --no-build-isolation
+

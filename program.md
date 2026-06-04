@@ -1,7 +1,7 @@
 # autoresearch
 
-This experiment asks the LLM to improve the **browser-image PPO** agent for
-Chrome Dino.
+This experiment asks the LLM to **speed up training** of the **browser-image PPO**
+agent for Chrome Dino.
 
 ## Context
 
@@ -31,23 +31,26 @@ Current browser-image setup:
   - the env is expected to recover from dead sessions / tab crashes instead of
     killing the trainer
 
-Current checkpoint baseline:
-
-- Best saved browser-image checkpoint:
-  `checkpoints/dino_ppo_browser_image_best.pth`
-- Best known eval from that line: `avg=75.7`, `min=57`, `max=99`
-- A longer continuation run was manually stopped after plateauing and did not
-  beat that checkpoint
-
 ## Goal
 
-The current target for browser-image PPO is:
+The objective of this program is to **make training faster**, not to push eval
+quality higher. Concretely, optimize the trainer for throughput and wall-clock
+efficiency:
 
-- primary target: `eval avg >= 5,000`
-- intermediate milestone: `eval avg >= 1,000`
+- **primary target: maximize environment steps per second (`steps/sec`)** sustained
+  over a 1-hour run
+- secondary target: minimize wall-clock time per PPO update (`sec/update`)
+- secondary target: maximize total updates and total env steps completed within a
+  fixed 1-hour budget
 
-This is a hard sample-efficiency problem. Do not assume image PPO will behave
-like the simulator feature agent.
+Treat eval score as a **guardrail, not the objective**. A speed change is only
+valid if learning does not visibly collapse: the run should still trend upward and
+stay in the same ballpark as the current baseline (`eval avg ~75`). Do not trade
+away all learning for raw throughput — a fast trainer that learns nothing is a
+failed experiment. But within that guardrail, **always prefer the faster option.**
+
+The bottleneck here is almost entirely the browser/env interaction loop, not the
+GPU. This is a systems-and-throughput problem, not a sample-efficiency problem.
 
 ## Setup
 
@@ -61,12 +64,18 @@ To start a new research pass, work with the user to:
    - `dino_rl/play_browser.py`
    - `dino_rl/policy_loader.py`
 4. Confirm that Chrome/ChromeDriver browser control is functional
-5. Kick off the experiment loop
+5. Establish a **baseline `steps/sec`** for the current code before changing anything
+6. Kick off the experiment loop
 
 ## Experimentation
 
 Each experiment uses a single GPU and runs for a **fixed wall-clock budget of 1
-hour**.
+hour**. The point of the fixed budget is to compare how much training work each
+variant gets done in the same amount of time.
+
+**Always run on GPU 2.** Pin every training, eval, and profiling run to that
+device with `CUDA_VISIBLE_DEVICES=2` (as in the commands below). Do not use any
+other GPU — the other devices may be in use by other work.
 
 Launch command from repo root:
 
@@ -101,25 +110,36 @@ CUDA_VISIBLE_DEVICES=2 python -u -m dino_rl.algorithms.ppo \
 - `dino_rl/play_browser.py`
 - `dino_rl/policy_loader.py`
 
-Everything needed for image PPO is fair game: CNN architecture, PPO
-hyperparameters, rollout length, minibatch size, entropy coefficient, clipping,
-reward scaling, evaluation cadence, browser observation preprocessing, action
-repeat, recovery behavior, and checkpointing.
+Everything that affects training throughput is fair game. Speed levers worth
+exploring include:
+
+- browser/env loop: reduce round-trips to ChromeDriver, batch or cache JS calls,
+  cut sleeps and polling intervals, tighten the screenshot → preprocess path
+- observation pipeline: cheaper crop/mask/resize, fewer copies, vectorized
+  preprocessing, faster grayscale/stacking
+- parallelism: multiple browser workers / parallel env rollouts feeding one learner
+- data movement: fewer host↔GPU transfers, pinned memory, larger contiguous batches
+- compute: mixed precision, `torch.compile`, CNN encoder cost, larger minibatches
+- PPO loop overhead: rollout length, number of epochs, eval cadence, logging cost
+- action repeat and frame-skip tuning to get more env progress per browser step
 
 ### What you CANNOT modify
 
 - `dino_rl/env.py` for the purpose of making the browser-image task easier
 - install new packages
 - silently switch the experiment back to simulator features
+- you may not "speed up" by disabling learning, shrinking the rollout to nothing,
+  or otherwise gutting the algorithm so it no longer trains
 
-The task here is specifically to improve PPO on **browser images**.
+The task here is specifically to make PPO on **browser images** train faster while
+still learning.
 
 ## Key Technical Facts
 
 - Action space is `3`, so max entropy is `ln(3) ~= 1.099`
-- Browser-image observations are expensive; update cadence is much slower than
-  simulator PPO
-- Current image defaults are tuned separately from feature PPO:
+- Browser-image observations are expensive; the env step is the dominant cost and
+  the main thing to optimize
+- Current image defaults:
   - `rollout_len = 512`
   - `minibatch_size = 64`
   - `eval_every = 5`
@@ -128,7 +148,8 @@ The task here is specifically to improve PPO on **browser images**.
   a CNN encoder
 - Browser failures such as `tab crashed`, disconnected sessions, or dead
   ChromeDriver connections should be treated as recoverable env failures, not as
-  acceptable reasons for the trainer to exit
+  acceptable reasons for the trainer to exit. Recovery should also be **fast** —
+  slow restarts eat the time budget.
 
 ## Output Format
 
@@ -145,31 +166,32 @@ View TensorBoard with:
 tensorboard --logdir results/runs
 ```
 
-Key metrics to watch:
+Key metrics to watch (speed first):
 
-- `eval/avg_score` — target metric
-- `train/avg_score` — noisy, but should trend up over time
-- `train/entropy` — if it stays near `1.099`, the policy is close to random
-- `train/clip_fraction` — healthy range is usually around `0.05` to `0.25`
-- `train/approx_kl` — should stay controlled, usually `< 0.05`
-- `train/value_loss` — critic fit
-- browser recovery messages in the log — useful to track instability in Chrome
+- **`steps/sec`** — the target metric; derive it from `Steps` and wall-clock if
+  the trainer does not print it directly, and add a throughput log line if needed
+- **`sec/update`** — time per PPO update; should go down
+- **total `Steps` / total `Update` count at the 1-hour mark** — more is better
+- browser recovery messages in the log — slow or frequent recovery kills throughput
+- guardrail only: `eval/avg_score` should not collapse versus baseline
+- guardrail only: `train/entropy` near `1.099` means the policy went random
 
 ## Logging Results
 
 When an experiment finishes, log it to `results.tsv` as tab-separated text:
 
 ```text
-commit	eval_avg	eval_max	status	description
+commit	steps_per_sec	total_steps	eval_avg	status	description
 ```
 
 Columns:
 
 1. short git commit hash
-2. `eval_avg`
-3. `eval_max`
-4. status: `keep`, `discard`, or `crash`
-5. short description of the image/browser experiment
+2. `steps_per_sec` (sustained, primary metric)
+3. `total_steps` completed within the 1-hour budget
+4. `eval_avg` (guardrail — did learning survive?)
+5. status: `keep`, `discard`, or `crash`
+6. short description of the speedup attempted
 
 Do not commit `results.tsv`.
 
@@ -180,17 +202,24 @@ Run on a dedicated branch such as `autoresearch/apr20-image`.
 Loop:
 
 1. Inspect the current branch and commit
-2. Make one focused image-PPO change
+2. Make one focused **throughput** change
 3. Commit the change
 4. Run a 1-hour browser-image PPO experiment
-5. Read the results from the log
+5. Read the results from the log: compute `steps/sec` and `total_steps`
 6. If the run crashed:
    - inspect the traceback
    - distinguish between a browser-recovery bug, a trainer bug, and a bad idea
 7. Record the result in `results.tsv`
-8. If `eval_avg` improved, keep the commit and keep the new best checkpoint
-9. If `eval_avg` did not improve, revert the code change and continue from the
-   last good point
+8. If `steps/sec` improved **and** eval did not collapse, keep the commit
+9. If `steps/sec` did not improve, or learning broke the guardrail, revert the
+   change and continue from the last good point
+
+### Profiling first
+
+Before guessing, profile. Identify where wall-clock actually goes (browser
+round-trips, screenshot capture, preprocessing, GPU step, optimization) and attack
+the biggest cost. Prefer changes justified by a measured bottleneck over
+speculative micro-optimizations.
 
 ### Timeout rule
 
@@ -202,10 +231,10 @@ Loop:
 
 - A recoverable Chrome crash should not kill PPO
 - If PPO still exits on browser failure, fix that first before trusting any
-  learning result
+  speed result
 
 ### Never confuse tracks
 
 The feature agent and the image agent are different experiments with different
-budgets, observations, and expectations. Improvements on feature PPO do not
-count as progress for this browser-image program.
+budgets, observations, and expectations. Speedups on feature PPO do not count as
+progress for this browser-image program.

@@ -1,0 +1,88 @@
+{
+  "runArgs": [
+    "--privileged",
+    "--gpus",
+    "all",
+    "--name",
+    "vscode-${localEnv:USER}-rl",
+    "--shm-size",
+    "512g",
+    "--network",
+    "host"
+  ],
+  "name": "V2V Cloning Dev Container",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": "../",
+    "options": ["--network=host"],
+    "args": {
+      "USER_UID": "${localEnv:UID}"
+    }
+  },
+  "mounts": [
+    "source=/home/dchebakov,target=/home/dchebakov,type=bind"
+  ],
+  "features": {
+    "ghcr.io/devcontainers/features/aws-cli:1": {},
+    "ghcr.io/devcontainers/features/common-utils:2": {},
+    "ghcr.io/iterative/features/nvtop:1": {},
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "[python]": {
+          "editor.rulers": [90],
+          "editor.defaultFormatter": "ms-python.black-formatter",
+          "editor.formatOnSave": true,
+          "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit",
+            "source.fixAll": "explicit"
+          }
+        },
+        "python.analysis.fixAll": [
+          "source.unusedImports",
+          "source.convertImportFormat"
+        ],
+        "python.analysis.extraPaths": [],
+        "python.testing.pytestEnabled": true,
+        "python.testing.unittestEnabled": false,
+        "python.defaultInterpreterPath": "/opt/conda/bin/python",
+        "black-formatter.importStrategy": "fromEnvironment",
+        "isort.importStrategy": "fromEnvironment",
+        "flake8.importStrategy": "fromEnvironment",
+        "flake8.args": [
+          "--toml-config",
+          "${containerWorkspaceFolder}/libs/python/linter/pyproject.toml"
+        ],
+        "black-formatter.args": [
+          "--config",
+          "${containerWorkspaceFolder}/libs/python/linter/pyproject.toml"
+        ],
+        "isort.args": [
+          "--settings-file",
+          "${containerWorkspaceFolder}/libs/python/linter/pyproject.toml"
+        ]
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.black-formatter",
+        "ms-python.isort",
+        "ms-python.vscode-pylance",
+        "github.vscode-github-actions",
+        "GitHub.vscode-pull-request-github",
+        "ms-toolsai.jupyter",
+        "njpwerner.autodocstring",
+        "ms-azuretools.vscode-docker",
+        "tamasfe.even-better-toml",
+        "mhutchie.git-graph",
+        "waderyan.gitblame"
+      ]
+    }
+  },
+  "containerEnv": {
+    "MKL_SERVICE_FORCE_INTEL": "1",
+    "MKL_THREADING_LAYER": "GNU"
+  },
+  "shutdownAction": "none"
+}
