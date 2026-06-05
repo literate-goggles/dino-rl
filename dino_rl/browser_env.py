@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -649,3 +650,93 @@ class ChromeDinoImageEnv:
 
     def close(self):
         self.game.close()
+
+
+class VecChromeDinoImageEnv:
+    """
+    Run several ChromeDinoImageEnv workers in parallel threads.
+
+    Browser steps are I/O-bound: each Selenium call blocks on a ChromeDriver
+    HTTP round-trip and releases the GIL, so worker threads give real
+    parallelism and let a single PPO learner consume many browser sessions at
+    once. Each worker owns its own Chrome + ChromeDriver, and a thread only ever
+    touches its own worker, so there is no shared-driver concurrency.
+
+    step() auto-resets any worker whose episode just ended (returning the
+    post-reset observation), so rollout collection never stalls on one env.
+    Per-worker browser recovery is handled inside ChromeDinoImageEnv, so a crash
+    in one worker does not take down the others.
+    """
+
+    def __init__(self, num_envs: int, **env_kwargs):
+        if num_envs < 1:
+            raise ValueError(f"num_envs must be >= 1, got {num_envs}.")
+        self.num_envs = num_envs
+        self._pool = ThreadPoolExecutor(max_workers=num_envs)
+
+        # Launch all browser sessions concurrently to cut startup time, and
+        # clean up any that did start if one fails to launch.
+        futures = [
+            self._pool.submit(ChromeDinoImageEnv, **env_kwargs)
+            for _ in range(num_envs)
+        ]
+        self.envs: list[ChromeDinoImageEnv] = []
+        launch_error: Exception | None = None
+        for future in futures:
+            try:
+                self.envs.append(future.result())
+            except Exception as exc:  # noqa: BLE001 - re-raised after cleanup
+                launch_error = exc
+        if launch_error is not None:
+            self.close()
+            raise launch_error
+
+        self.action_space = self.envs[0].action_space
+        self.obs_shape = (
+            self.envs[0].frame_stack,
+            self.envs[0].obs_size,
+            self.envs[0].obs_size,
+        )
+
+    def reset(self) -> np.ndarray:
+        obs = list(self._pool.map(lambda env: env.reset(), self.envs))
+        return np.stack(obs, axis=0)
+
+    def step(self, actions):
+        """Step every worker in parallel; auto-reset finished workers.
+
+        Returns batched (obs[N], rewards[N], dones[N], infos[list]).
+        """
+        results = list(
+            self._pool.map(
+                lambda i: self.envs[i].step(int(actions[i])),
+                range(self.num_envs),
+            )
+        )
+        obs = [r[0] for r in results]
+        rewards = np.array([r[1] for r in results], dtype=np.float32)
+        dones = np.array([bool(r[2]) for r in results], dtype=bool)
+        infos = [r[3] for r in results]
+
+        # Auto-reset finished workers in parallel so the next tick starts fresh.
+        reset_ids = [i for i, done in enumerate(dones) if done]
+        if reset_ids:
+            reset_obs = list(
+                self._pool.map(lambda i: self.envs[i].reset(), reset_ids)
+            )
+            for i, frame in zip(reset_ids, reset_obs):
+                obs[i] = frame
+
+        return np.stack(obs, axis=0), rewards, dones, infos
+
+    def get_scores(self) -> np.ndarray:
+        """Current per-worker score (cached, no browser round-trip)."""
+        return np.array([env.get_score() for env in self.envs], dtype=np.int64)
+
+    def close(self):
+        for env in self.envs:
+            try:
+                env.close()
+            except Exception:
+                pass
+        self._pool.shutdown(wait=True)
