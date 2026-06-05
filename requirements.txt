@@ -1,4 +1,7 @@
-torch>=2.5.1
+# Blackwell GPUs (B200 = sm_100) need torch >= 2.7 built for CUDA 12.8.
+# Install the cu128 wheel explicitly (see Dockerfile); the default index may
+# ship a build without sm_100 kernels.
+torch>=2.7.0
 numpy>=2.4.4
 scipy>=1.17.1
 scikit-learn>=1.8.0

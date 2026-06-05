@@ -38,3 +38,11 @@ RUN grep -v "flash-attn" /build/requirements.txt > /build/requirements_no_flash.
 RUN pip install -r /build/requirements_no_flash.txt
 RUN pip install flash-attn==2.7.0.post2 --no-build-isolation
 
+# The base image ships torch built for CUDA 12.4 (kernels up to sm_90), which
+# cannot run on Blackwell GPUs (B200 = sm_100): every CUDA op fails with
+# "no kernel image is available for execution on the device". Reinstall torch
+# from the CUDA 12.8 index, which bundles its own CUDA runtime and includes
+# sm_100/sm_120 kernels. Done last so it overrides the base image's torch.
+RUN pip install --upgrade --index-url https://download.pytorch.org/whl/cu128 \
+    torch torchvision torchaudio
+
