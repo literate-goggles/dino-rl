@@ -30,6 +30,12 @@ from selenium.webdriver.chrome.options import Options
 from dino_rl.env import ActionSpace
 from dino_rl.feature_contract import FEATURE_DIM, build_browser_state_js
 
+# Re-aliasing Runner.instance_ inside each hot-loop JS payload (instead of a
+# separate execute_script round-trip) keeps the call self-healing while saving
+# one Selenium round-trip (~6ms) per call. ChromeDriver round-trips dominate the
+# env step, so cutting redundant ones is the main throughput lever.
+_RUNNER_ALIAS_JS = "Runner.instance_ = Runner.getInstance();\n"
+
 GET_CANVAS_JS = """
 Runner.instance_ = Runner.getInstance();
 var canvas = document.getElementsByClassName('runner-canvas')[0];
@@ -70,7 +76,10 @@ class ChromeDinoGame:
         startup_retry_delay_sec: float = 1.0,
     ):
         self.page_url = page_url
-        self.state_js = build_browser_state_js()
+        # Self-aliasing state poll: ensures Runner.instance_ in the same
+        # round-trip as the state read, so the hot loop needs no separate
+        # _ensure_runner_instance() call.
+        self.state_js = _RUNNER_ALIAS_JS + build_browser_state_js()
         self.accelerate = accelerate
         self._started = False
         self._duck_pressed = False
@@ -231,7 +240,8 @@ class ChromeDinoGame:
 
     def get_state(self) -> dict | None:
         try:
-            self._ensure_runner_instance()
+            # state_js self-aliases Runner.instance_, so no separate
+            # _ensure_runner_instance() round-trip is needed here.
             return self.driver.execute_script(self.state_js)
         except JavascriptException:
             return None
@@ -244,7 +254,8 @@ class ChromeDinoGame:
 
     def get_frame(self, obs_size: int | None = 84) -> np.ndarray:
         """Capture the current runner canvas as a grayscale frame."""
-        self._ensure_runner_instance()
+        # GET_CANVAS_JS self-aliases Runner.instance_, so no separate
+        # _ensure_runner_instance() round-trip is needed here.
         encoded = self.driver.execute_script(GET_CANVAS_JS)
         if encoded is None:
             raise RuntimeError("Runner canvas is not available.")
