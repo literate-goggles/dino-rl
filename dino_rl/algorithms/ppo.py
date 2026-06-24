@@ -281,6 +281,12 @@ BROWSER_IMAGE_ACTION_REPEAT = 2
 BROWSER_IMAGE_ROLLOUT_LEN = 512
 BROWSER_IMAGE_PPO_EPOCHS = 4
 BROWSER_IMAGE_MINIBATCH_SIZE = 64
+# Browser env steps are I/O-bound (Selenium round-trips release the GIL), so we
+# run several headless Chrome workers in parallel threads feeding one learner.
+# The env is ~99.5% of wall-clock and embarrassingly parallel, so this is the
+# main throughput lever. With N workers, each rollout collects rollout_len*N
+# transitions for ~the wall-clock of one worker.
+BROWSER_IMAGE_NUM_ENVS = 8
 # 3 episodes produced eval avgs with std ~30 (e.g. baseline scores
 # [96, 49, 101] -> avg 82 that is not reproducible). 7 reduces SEM ~1.5x
 # so small (10+ point) improvements can actually be distinguished from noise.
@@ -660,6 +666,107 @@ class RolloutBuffer:
         self.ptr = 0
 
 
+class VectorizedRolloutBuffer:
+    """
+    Rollout buffer for N parallel environments.
+
+    Stores transitions in (T, N, ...) layout during collection (T = steps per
+    env, N = num envs), computes GAE independently per env (each column is its
+    own trajectory), then exposes flat (T*N, ...) views named exactly like
+    RolloutBuffer so ppo_update works unchanged.
+
+    next_states are not stored because the PPO update never uses them (only the
+    re-evaluated states / actions / advantages / returns), which halves buffer
+    memory versus the single-env buffer.
+    """
+
+    def __init__(
+        self,
+        steps_per_env: int,
+        num_envs: int,
+        state_shape: tuple[int, ...] | int,
+        device: str,
+    ):
+        self.T = steps_per_env
+        self.N = num_envs
+        # Total transitions per rollout; reused by get_minibatches and as the
+        # per-update step count.
+        self.rollout_len = steps_per_env * num_envs
+        self.device = device
+        self.ptr = 0
+        if isinstance(state_shape, int):
+            state_shape = (state_shape,)
+        self.state_shape = tuple(state_shape)
+
+        T, N = self.T, self.N
+        self._states = torch.zeros((T, N, *self.state_shape), device=device)
+        self._actions = torch.zeros((T, N), dtype=torch.long, device=device)
+        self._rewards = torch.zeros((T, N), device=device)
+        self._dones = torch.zeros((T, N), device=device)
+        self._log_probs = torch.zeros((T, N), device=device)
+        self._values = torch.zeros((T, N), device=device)
+
+        # Flat (T*N, ...) views populated by compute_gae for the update.
+        self.states = self._states.reshape(T * N, *self.state_shape)
+        self.actions = self._actions.reshape(T * N)
+        self.log_probs = self._log_probs.reshape(T * N)
+        self.advantages = torch.zeros(T * N, device=device)
+        self.returns = torch.zeros(T * N, device=device)
+
+    def store_batch(self, *, states, actions, rewards, dones, log_probs, values):
+        """Store one transition for every env at the current time index."""
+        idx = self.ptr
+        self._states[idx] = states
+        self._actions[idx] = actions
+        self._rewards[idx] = rewards
+        self._dones[idx] = dones
+        self._log_probs[idx] = log_probs
+        self._values[idx] = values
+        self.ptr += 1
+
+    def compute_gae(self, last_values: torch.Tensor, gamma: float, lam: float):
+        """
+        Vectorized GAE over N independent env trajectories.
+
+        last_values: (N,) value of the state after the final stored step for
+        each env. Identical recursion to RolloutBuffer.compute_gae but done in
+        tensor form across the env dimension (and across T without per-element
+        .item() calls, so it is also much faster).
+        """
+        advantages = torch.zeros((self.T, self.N), device=self.device)
+        gae = torch.zeros(self.N, device=self.device)
+        for t in reversed(range(self.T)):
+            if t == self.T - 1:
+                next_value = last_values
+            else:
+                next_value = self._values[t + 1]
+            next_non_terminal = 1.0 - self._dones[t]
+            delta = (
+                self._rewards[t]
+                + gamma * next_value * next_non_terminal
+                - self._values[t]
+            )
+            gae = delta + gamma * lam * next_non_terminal * gae
+            advantages[t] = gae
+        returns = advantages + self._values
+
+        # Flatten to (T*N,) for the update. ppo_update reads these by name.
+        self.advantages = advantages.reshape(self.T * self.N)
+        self.returns = returns.reshape(self.T * self.N)
+
+    def get_minibatches(self, minibatch_size: int):
+        """Yield shuffled minibatch indices over all T*N transitions."""
+        indices = np.arange(self.rollout_len)
+        np.random.shuffle(indices)
+        for start in range(0, self.rollout_len, minibatch_size):
+            batch_idx = indices[start : start + minibatch_size]
+            yield torch.tensor(batch_idx, dtype=torch.long, device=self.device)
+
+    def reset(self):
+        """Reset the write pointer for the next rollout."""
+        self.ptr = 0
+
+
 # ---------------------------------------------------------------------------
 # PPO Update
 # ---------------------------------------------------------------------------
@@ -854,7 +961,17 @@ def make_env(
 
     from dino_rl.browser_env import ChromeDinoImageEnv
 
-    return ChromeDinoImageEnv(
+    return ChromeDinoImageEnv(**_browser_image_env_kwargs(env_kwargs))
+
+
+def _browser_image_env_kwargs(env_kwargs: dict | None) -> dict:
+    """Map the trainer's env_kwargs to ChromeDinoImageEnv constructor args.
+
+    Shared by the single-env (make_env) and parallel (VecChromeDinoImageEnv)
+    paths so both build identical browser-image workers.
+    """
+    env_kwargs = dict(env_kwargs or {})
+    return dict(
         headless=env_kwargs.get("browser_headless", True),
         accelerate=env_kwargs.get("browser_accelerate", False),
         page_url=env_kwargs.get("browser_url", "chrome://dino"),
@@ -1038,6 +1155,69 @@ def collect_rollout(
     return state, episode_scores
 
 
+@torch.no_grad()
+def collect_rollout_vec(
+    vec_env,
+    model: nn.Module,
+    buffer: VectorizedRolloutBuffer,
+    states: np.ndarray,
+    device: str,
+    score_delta_coeff: float,
+):
+    """
+    Collect T steps from N parallel envs (T*N transitions) for one PPO update.
+
+    Mirrors collect_rollout but batches the policy forward over the N envs and
+    steps them all at once through the threaded vec env. Each env column is an
+    independent trajectory; the vec env auto-resets finished envs, so done[i]
+    marks a trajectory boundary and the returned states[i] is already the
+    post-reset observation for the next step.
+    """
+    buffer.reset()
+    episode_scores: list[int] = []
+    prev_scores = vec_env.get_scores().astype(np.float32)  # (N,)
+    states_t = torch.as_tensor(states, dtype=torch.float32, device=device)
+
+    for _step in range(buffer.T):
+        # One batched forward over all N envs.
+        actions, log_probs, values = model.get_action_and_value(states_t)
+        actions_np = actions.detach().cpu().numpy()
+
+        next_states, rewards, dones, infos = vec_env.step(actions_np)
+
+        scores = np.array([info["score"] for info in infos], dtype=np.float32)
+        score_delta = np.maximum(scores - prev_scores, 0.0)
+        shaped_rewards = rewards + score_delta_coeff * score_delta
+
+        buffer.store_batch(
+            states=states_t,
+            actions=actions,
+            rewards=torch.as_tensor(
+                shaped_rewards, dtype=torch.float32, device=device
+            ),
+            dones=torch.as_tensor(dones, dtype=torch.float32, device=device),
+            log_probs=log_probs,
+            values=values,
+        )
+
+        for i, done in enumerate(dones):
+            if done:
+                episode_scores.append(int(infos[i]["score"]))
+        # Just-finished envs were auto-reset, so their score restarts at 0 and
+        # the next score-delta is measured within the fresh episode.
+        prev_scores = np.where(dones, 0.0, scores)
+
+        states = next_states
+        states_t = torch.as_tensor(states, dtype=torch.float32, device=device)
+
+    # Bootstrap value for each env's final state.
+    _, last_values = model(states_t)
+    last_values = last_values.squeeze(-1)  # (N,)
+    buffer.compute_gae(last_values, gamma=GAMMA, lam=LAM_GAE)
+
+    return states, episode_scores
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -1071,6 +1251,7 @@ def train(
     entropy_coeff: float = ENTROPY_COEFF,
     value_coeff: float = VALUE_COEFF,
     score_delta_coeff: float = SCORE_DELTA_COEFF,
+    num_envs: int = 1,
 ):
     """
     Train a policy using PPO on the Dino game.
@@ -1156,13 +1337,32 @@ def train(
     print(f"       entropy_coeff={entropy_coeff}  value_coeff={value_coeff}")
     print(f"       score_delta_coeff={score_delta_coeff}")
     print(
-        f"       total steps = {n_updates} * {rollout_len} = {n_updates * rollout_len}"
+        f"       total steps = {n_updates} * {rollout_len} * {num_envs} envs "
+        f"= {n_updates * rollout_len * num_envs}"
     )
     print()
 
-    env = make_env(env_backend, observation_mode, env_kwargs)
-    state = env.reset()
-    state_shape = tuple(state.shape)
+    # Parallel browser workers are only supported (and only useful) for the
+    # I/O-bound browser-image env. Other configs fall back to a single env.
+    vectorized = num_envs > 1
+    if vectorized and not (observation_mode == "image" and env_backend == "browser"):
+        raise ValueError(
+            "num_envs > 1 is only supported for browser image observations."
+        )
+
+    if vectorized:
+        from dino_rl.browser_env import VecChromeDinoImageEnv
+
+        env = VecChromeDinoImageEnv(
+            num_envs, **_browser_image_env_kwargs(env_kwargs)
+        )
+        state = env.reset()  # (N, C, H, W)
+        state_shape = tuple(state.shape[1:])
+        print(f"       num_envs={num_envs} (parallel browser workers)")
+    else:
+        env = make_env(env_backend, observation_mode, env_kwargs)
+        state = env.reset()
+        state_shape = tuple(state.shape)
     model = make_model(observation_mode, state_shape, ACTION_SIZE).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-5)
     loaded_checkpoint = None
@@ -1185,7 +1385,10 @@ def train(
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    buffer = RolloutBuffer(rollout_len, state_shape, device)
+    if vectorized:
+        buffer = VectorizedRolloutBuffer(rollout_len, num_envs, state_shape, device)
+    else:
+        buffer = RolloutBuffer(rollout_len, state_shape, device)
 
     if writer is None:
         writer = create_writer(algo_name)
@@ -1208,21 +1411,36 @@ def train(
     # ------------------------------------------------------------------
     for update in range(1, n_updates + 1):
         # ---- 1. Collect rollout --------------------------------------
+        rollout_start = time.time()
         model.eval()
-        state, episode_scores = collect_rollout(
-            env,
-            model,
-            buffer,
-            state,
-            device,
-            score_delta_coeff,
-        )
+        if vectorized:
+            state, episode_scores = collect_rollout_vec(
+                env,
+                model,
+                buffer,
+                state,
+                device,
+                score_delta_coeff,
+            )
+        else:
+            state, episode_scores = collect_rollout(
+                env,
+                model,
+                buffer,
+                state,
+                device,
+                score_delta_coeff,
+            )
         model.train()
+        rollout_time = time.time() - rollout_start
 
-        total_steps += rollout_len
+        # buffer.rollout_len is rollout_len for single env, rollout_len*num_envs
+        # for the vectorized buffer -- i.e. the real env-step count collected.
+        total_steps += buffer.rollout_len
         all_episode_scores.extend(episode_scores)
 
         # ---- 2. PPO parameter update ---------------------------------
+        update_start = time.time()
         metrics = ppo_update(
             model=model,
             optimizer=optimizer,
@@ -1233,6 +1451,26 @@ def train(
             entropy_coeff=entropy_coeff,
             value_coeff=value_coeff,
         )
+        optimize_time = time.time() - update_start
+
+        # ---- Throughput (primary metric) -----------------------------
+        # steps/sec for this update (env + optimize), plus the sustained
+        # rate since training started. The rollout (browser/env) cost
+        # dominates, so we surface it split out from the GPU optimize step.
+        sec_per_update = rollout_time + optimize_time
+        steps_this_update = buffer.rollout_len  # rollout_len * num_envs when vectorized
+        update_steps_per_sec = (
+            steps_this_update / sec_per_update if sec_per_update else 0.0
+        )
+        elapsed_so_far = time.time() - train_start
+        sustained_steps_per_sec = (
+            total_steps / elapsed_so_far if elapsed_so_far else 0.0
+        )
+        writer.add_scalar("perf/steps_per_sec", update_steps_per_sec, update)
+        writer.add_scalar("perf/steps_per_sec_sustained", sustained_steps_per_sec, update)
+        writer.add_scalar("perf/sec_per_update", sec_per_update, update)
+        writer.add_scalar("perf/rollout_time", rollout_time, update)
+        writer.add_scalar("perf/optimize_time", optimize_time, update)
 
         # ---- 3. Anneal learning rate ---------------------------------
         scheduler.step()
@@ -1258,6 +1496,13 @@ def train(
                 f"Entropy {metrics['entropy']:.4f} | "
                 f"KL {metrics['approx_kl']:.5f} | "
                 f"Clip {metrics['clip_frac']:.3f}"
+            )
+            print(
+                f"  >> Throughput @ update {update}: "
+                f"{update_steps_per_sec:6.2f} steps/sec "
+                f"({sustained_steps_per_sec:6.2f} sustained) | "
+                f"sec/update {sec_per_update:6.2f} "
+                f"(rollout {rollout_time:6.2f} + optimize {optimize_time:5.2f})"
             )
             writer.add_scalar("train/policy_loss", metrics["policy_loss"], update)
             writer.add_scalar("train/value_loss", metrics["value_loss"], update)
@@ -1500,6 +1745,15 @@ if __name__ == "__main__":
         help="Repeat each browser image action for this many frames",
     )
     parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=1,
+        help=(
+            "Parallel browser workers for browser image mode "
+            "(>1 enables the threaded vectorized env)"
+        ),
+    )
+    parser.add_argument(
         "--target-eval-score",
         type=int,
         default=TARGET_EVAL_SCORE,
@@ -1589,4 +1843,5 @@ if __name__ == "__main__":
         entropy_coeff=args.entropy_coeff,
         value_coeff=args.value_coeff,
         score_delta_coeff=args.score_delta_coeff,
+        num_envs=args.num_envs,
     )
